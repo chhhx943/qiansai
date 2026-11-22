@@ -40,5 +40,6 @@ private:
 };
 
 QSize fitVideoInside(const QSize &source, const QSize &bounds);
+qint64 frameDurationMs(int rateNumerator, int rateDenominator);
 
 #endif // VIDEORUNTIME_H

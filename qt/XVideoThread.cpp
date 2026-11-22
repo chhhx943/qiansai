@@ -1,6 +1,7 @@
 #include "XVideoThread.h"
 #include <QDebug>
 #include <QElapsedTimer>
+#include <QDateTime>
 #include <QMutex>
 #include <QThread>
 #include <cstdio>
@@ -78,6 +79,40 @@ void XVideoThread::seekToMs(qint64 ms)
     m_seekRequested = true;
 }
 
+void XVideoThread::setOutputSize(const QSize &size)
+{
+    QMutexLocker locker(&m_geometryMutex);
+    m_outputSize = size;
+}
+
+bool XVideoThread::takeLatestFrame(quint64 lastSequence,
+                                   VideoFrameSnapshot *frame)
+{
+    return m_frameMailbox.takeLatest(lastSequence, frame);
+}
+
+quint64 XVideoThread::decodedFrames() const
+{
+    return m_decodedFrames.load(std::memory_order_relaxed);
+}
+
+quint64 XVideoThread::overwrittenFrames() const
+{
+    return m_frameMailbox.overwrittenFrames();
+}
+
+QSize XVideoThread::inputSize() const
+{
+    QMutexLocker locker(&m_geometryMutex);
+    return m_inputSize;
+}
+
+double XVideoThread::nominalFps() const
+{
+    QMutexLocker locker(&m_geometryMutex);
+    return m_nominalFps;
+}
+
 double XVideoThread::playbackRate() const
 {
     QMutexLocker locker(&m_controlMutex);
@@ -136,6 +171,14 @@ bool XVideoThread::init()
     }
 
     const QByteArray urlBytes = m_url.toUtf8();
+    m_fmtCtx = avformat_alloc_context();
+    if(!m_fmtCtx) {
+        emit sig_errorMessage(QStringLiteral("创建输入上下文失败"));
+        av_dict_free(&opts);
+        return false;
+    }
+    m_fmtCtx->interrupt_callback.callback = &XVideoThread::interruptCallback;
+    m_fmtCtx->interrupt_callback.opaque = this;
     fprintf(stderr, "[RTMP][init] avformat_open_input start\n");
     int ret = avformat_open_input(&m_fmtCtx, urlBytes.constData(), nullptr, &opts);
     if(ret < 0){
@@ -144,6 +187,9 @@ bool XVideoThread::init()
         qWarning().noquote() << message;
         emit sig_errorMessage(message);
         av_dict_free(&opts);
+        if(m_fmtCtx)
+            avformat_free_context(m_fmtCtx);
+        m_fmtCtx = nullptr;
         return false;
     }
     fprintf(stderr, "[RTMP][init][cost] avformat_open_input ok cost=%lldms fmtCtx=%p\n",
@@ -220,6 +266,15 @@ bool XVideoThread::init()
             unInit();
             return false;
         }
+    }
+
+    const AVRational guessedRate = av_guess_frame_rate(m_fmtCtx, st, nullptr);
+    {
+        QMutexLocker locker(&m_geometryMutex);
+        m_inputSize = QSize(st->codecpar->width, st->codecpar->height);
+        m_nominalFps = guessedRate.num > 0 && guessedRate.den > 0
+                           ? av_q2d(guessedRate)
+                           : 0.0;
     }
 
     m_durationMs = 0;
@@ -310,7 +365,33 @@ void XVideoThread::unInit()
 
 QImage XVideoThread::frameToImage(AVFrame *frame)
 {
-    QImage img(frame->width, frame->height, QImage::Format_RGB32);
+    QSize requestedSize;
+    {
+        QMutexLocker locker(&m_geometryMutex);
+        requestedSize = m_outputSize;
+    }
+    const QSize sourceSize(frame->width, frame->height);
+    const QSize targetSize = requestedSize.isValid()
+                                 ? fitVideoInside(sourceSize, requestedSize)
+                                 : sourceSize;
+    if(!targetSize.isValid())
+        return QImage();
+
+    m_swsCtx = sws_getCachedContext(m_swsCtx,
+                                    frame->width,
+                                    frame->height,
+                                    static_cast<AVPixelFormat>(frame->format),
+                                    targetSize.width(),
+                                    targetSize.height(),
+                                    AV_PIX_FMT_RGB32,
+                                    SWS_FAST_BILINEAR,
+                                    nullptr,
+                                    nullptr,
+                                    nullptr);
+    if(!m_swsCtx)
+        return QImage();
+
+    QImage img(targetSize, QImage::Format_RGB32);
     uint8_t *dst[4] = { img.bits(), nullptr, nullptr, nullptr };
     int dst_linesize[4] = { (int)img.bytesPerLine(),0,0,0 };
     sws_scale(m_swsCtx,
@@ -320,8 +401,23 @@ QImage XVideoThread::frameToImage(AVFrame *frame)
               frame->height,
               dst,
               dst_linesize);
-    qDebug() << "转换 QImage 完成, 宽:" << frame->width << " 高:" << frame->height;
     return img;
+}
+
+int XVideoThread::interruptCallback(void *opaque)
+{
+    const auto *thread = static_cast<XVideoThread *>(opaque);
+    return thread && thread->isInterruptionRequested() ? 1 : 0;
+}
+
+bool XVideoThread::sleepInterruptibly(int milliseconds)
+{
+    for(int elapsed = 0; elapsed < milliseconds; elapsed += 50) {
+        if(isInterruptionRequested())
+            return false;
+        QThread::msleep(static_cast<unsigned long>(qMin(50, milliseconds - elapsed)));
+    }
+    return !isInterruptionRequested();
 }
 
 QString XVideoThread::avErrorString(int errorCode) const
@@ -331,13 +427,14 @@ QString XVideoThread::avErrorString(int errorCode) const
     return QString::fromUtf8(buffer);
 }
 
-void XVideoThread::run()
+bool XVideoThread::decodeSession()
 {
-    fprintf(stderr, "[RTMP][run] thread run begin XVideoThread=%p\n", static_cast<void *>(this));
+    fprintf(stderr, "[RTMP][session] begin XVideoThread=%p\n", static_cast<void *>(this));
+    m_frameMailbox.clear();
     if(!init()){
-        fprintf(stderr, "[RTMP][run] init failed\n");
+        fprintf(stderr, "[RTMP][session] init failed\n");
         emit sig_sendInitState(false);
-        return;
+        return false;
     }
 
     AVPacket *pkt = av_packet_alloc();
@@ -351,7 +448,7 @@ void XVideoThread::run()
         av_packet_free(&pkt);
         av_frame_free(&frame);
         unInit();
-        return;
+        return false;
     }
 
     emit sig_sendInitState(true);
@@ -362,6 +459,9 @@ void XVideoThread::run()
     QElapsedTimer playbackTimer;
     bool playbackTimerStarted = false;
     qint64 playbackBaseMs = 0;
+    const AVRational streamRate =
+        av_guess_frame_rate(m_fmtCtx, m_fmtCtx->streams[m_videoIndex], nullptr);
+    const qint64 fallbackFrameMs = frameDurationMs(streamRate.num, streamRate.den);
 
     while(!isInterruptionRequested()){
         qint64 seekMs = 0;
@@ -426,27 +526,7 @@ void XVideoThread::run()
                 break;
             }
 
-            if(!m_swsCtx){
-                fprintf(stderr,
-                        "[RTMP][sws] create sws width=%d height=%d pix_fmt=%d\n",
-                        frame->width,
-                        frame->height,
-                        frame->format);
-                m_swsCtx = sws_getContext(
-                    frame->width, frame->height,
-                    (AVPixelFormat)frame->format,
-                    frame->width, frame->height,
-                    AV_PIX_FMT_RGB32,
-                    SWS_BICUBIC, nullptr, nullptr, nullptr);
-                if(!m_swsCtx){
-                    fprintf(stderr, "[RTMP][sws] create sws failed\n");
-                    emit sig_errorMessage(QStringLiteral("创建像素格式转换器失败"));
-                    av_frame_unref(frame);
-                    continue;
-                }
-            }
-
-            qint64 relativePosMs = decodedFrameCount * 33;
+            qint64 relativePosMs = decodedFrameCount * fallbackFrameMs;
             if(frame->best_effort_timestamp != AV_NOPTS_VALUE){
                 const qint64 ptsMs = av_rescale_q(frame->best_effort_timestamp,
                                                   m_fmtCtx->streams[m_videoIndex]->time_base,
@@ -470,10 +550,21 @@ void XVideoThread::run()
                 emit sig_positionChanged(relativePosMs);
             }
 
-            QImage img = frameToImage(frame);
-            emit sig_SendOneFrame(img);
+            const QImage img = frameToImage(frame);
+            if(img.isNull()) {
+                emit sig_errorMessage(QStringLiteral("创建像素格式转换器失败"));
+                av_frame_unref(frame);
+                continue;
+            }
+
+            m_frameMailbox.publish(img,
+                                   relativePosMs,
+                                   QDateTime::currentMSecsSinceEpoch());
+            if(!m_isLiveStream)
+                emit sig_SendOneFrame(img);
             emittedFrame = true;
             ++decodedFrameCount;
+            m_decodedFrames.fetch_add(1, std::memory_order_relaxed);
             if(decodedFrameCount <= 10 || decodedFrameCount % 50 == 0){
                 fprintf(stderr,
                         "[RTMP][decode] frame #%d width=%d height=%d format=%d videoPackets=%d totalPackets=%d\n",
@@ -500,9 +591,42 @@ void XVideoThread::run()
     av_frame_free(&frame);
     unInit();
     fprintf(stderr,
-            "[RTMP][run] thread run end totalPackets=%d videoPackets=%d decodedFrames=%d interrupted=%d\n",
+            "[RTMP][session] end totalPackets=%d videoPackets=%d decodedFrames=%d interrupted=%d\n",
             readPacketCount,
             videoPacketCount,
             decodedFrameCount,
+            isInterruptionRequested() ? 1 : 0);
+    return emittedFrame;
+}
+
+void XVideoThread::run()
+{
+    fprintf(stderr, "[RTMP][run] thread run begin XVideoThread=%p\n", static_cast<void *>(this));
+    const bool liveInput = isLiveUrl();
+    static const int reconnectDelaysMs[] = {250, 500, 1000, 2000, 3000};
+    int retry = 0;
+
+    do {
+        const bool emittedFrame = decodeSession();
+        if(!liveInput || isInterruptionRequested())
+            break;
+
+        if(emittedFrame)
+            retry = 0;
+
+        const int delayIndex = qMin(retry, 4);
+        const int delayMs = reconnectDelaysMs[delayIndex];
+        fprintf(stderr,
+                "[RTMP][reconnect] emitted=%d retry=%d delay=%dms\n",
+                emittedFrame ? 1 : 0,
+                retry + 1,
+                delayMs);
+        emit sig_errorMessage(QStringLiteral("实时流中断，%1 ms 后重连").arg(delayMs));
+        ++retry;
+        if(!sleepInterruptibly(delayMs))
+            break;
+    } while(!isInterruptionRequested());
+
+    fprintf(stderr, "[RTMP][run] thread run end interrupted=%d\n",
             isInterruptionRequested() ? 1 : 0);
 }

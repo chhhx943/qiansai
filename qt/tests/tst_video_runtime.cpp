@@ -11,6 +11,8 @@ private slots:
     void mailboxDoesNotRedeliverSequence();
     void rateSamplerUsesCounterDelta();
     void fitInsidePreservesSixteenByNine();
+    void frameDurationUsesStreamRate();
+    void clearRemovesOldFrameAndCounters();
 };
 
 void VideoRuntimeTest::mailboxReturnsOnlyNewestFrame()
@@ -52,6 +54,25 @@ void VideoRuntimeTest::fitInsidePreservesSixteenByNine()
     QCOMPARE(fitVideoInside(QSize(1920, 1080), QSize(700, 1000)), QSize(700, 394));
     QCOMPARE(fitVideoInside(QSize(), QSize(700, 1000)), QSize());
     QCOMPARE(fitVideoInside(QSize(1920, 1080), QSize()), QSize());
+}
+
+void VideoRuntimeTest::frameDurationUsesStreamRate()
+{
+    QCOMPARE(frameDurationMs(60, 1), qint64(17));
+    QCOMPARE(frameDurationMs(60000, 1001), qint64(17));
+    QCOMPARE(frameDurationMs(0, 0), qint64(17));
+}
+
+void VideoRuntimeTest::clearRemovesOldFrameAndCounters()
+{
+    VideoFrameMailbox mailbox;
+    mailbox.publish(QImage(2, 2, QImage::Format_RGB32), 0, 0);
+    mailbox.publish(QImage(2, 2, QImage::Format_RGB32), 0, 1);
+    mailbox.clear();
+
+    VideoFrameSnapshot frame;
+    QVERIFY(!mailbox.takeLatest(0, &frame));
+    QCOMPARE(mailbox.overwrittenFrames(), quint64(0));
 }
 
 QTEST_MAIN(VideoRuntimeTest)

@@ -86,3 +86,12 @@ QSize fitVideoInside(const QSize &source, const QSize &bounds)
          + source.height() / 2) / source.height();
     return QSize(static_cast<int>(heightLimitedWidth), bounds.height());
 }
+
+qint64 frameDurationMs(int rateNumerator, int rateDenominator)
+{
+    if(rateNumerator <= 0 || rateDenominator <= 0)
+        return 17;
+
+    const double duration = 1000.0 * rateDenominator / rateNumerator;
+    return qMax<qint64>(1, qRound64(duration));
+}

@@ -6,6 +6,10 @@
 #include <QObject>
 #include <QDebug>
 #include <QMutex>
+#include <QSize>
+#include <atomic>
+
+#include "VideoRuntime.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -38,6 +42,12 @@ public:
     void setUrl(const QString &url); // 设置流地址
     void setPlaybackRate(double rate);
     void seekToMs(qint64 ms);
+    void setOutputSize(const QSize &size);
+    bool takeLatestFrame(quint64 lastSequence, VideoFrameSnapshot *frame);
+    quint64 decodedFrames() const;
+    quint64 overwrittenFrames() const;
+    QSize inputSize() const;
+    double nominalFps() const;
 
 signals:
     void sig_sendInitState(bool ok);    // 初始化成功或失败
@@ -53,11 +63,14 @@ private:
     bool init();        // 初始化 AVFormatContext
     void unInit();      // 释放资源
 
+    bool decodeSession();
+    bool sleepInterruptibly(int milliseconds);
     QImage frameToImage(AVFrame *frame);
     QString avErrorString(int errorCode) const;
     bool isLiveUrl() const;
     double playbackRate() const;
     bool takePendingSeek(qint64 *positionMs);
+    static int interruptCallback(void *opaque);
 
 private:
     QString m_url;
@@ -74,6 +87,12 @@ private:
     double m_playbackRate        = 1.0;
     bool m_seekRequested         = false;
     qint64 m_pendingSeekMs       = 0;
+    mutable QMutex m_geometryMutex;
+    QSize m_outputSize;
+    QSize m_inputSize;
+    double m_nominalFps = 0.0;
+    VideoFrameMailbox m_frameMailbox;
+    std::atomic<quint64> m_decodedFrames{0};
 };
 
 #endif // XVIDEOTHREAD_H
