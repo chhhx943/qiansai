@@ -46,9 +46,8 @@ HEADERS += \
 qnx: target.path = /tmp/$${TARGET}/bin
 else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
-INCLUDEPATH += /usr/local/ffmpeg/FFmpeg-master
-LIBS += -L/usr/local/ffmpeg/FFmpeg-master\
-        -lavformat\
+QMAKE_CXXFLAGS += -isystem /usr/include/x86_64-linux-gnu
+LIBS += -lavformat\
         -lavfilter\
         -lavcodec\
         -lavutil\

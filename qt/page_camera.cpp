@@ -12,6 +12,7 @@
 #include <QStandardPaths>
 #include <QSettings>
 #include <cstdio>
+#include <utility>
 
 #include "XVideoThread.h"
 
@@ -57,6 +58,12 @@ PageCamera::PageCamera(QWidget *parent) : QWidget(parent)
                            videoLabel,
                            QStringLiteral("RTMP"));
     });
+
+    const QString environmentRtmpUrl = qEnvironmentVariable("QT_RTMP_URL").trimmed();
+    if(!environmentRtmpUrl.isEmpty())
+        rtmpLineEdit->setText(environmentRtmpUrl);
+    if(qEnvironmentVariableIntValue("QT_RTMP_AUTOPLAY") == 1)
+        QTimer::singleShot(0, rtmpPlayBtn, &QPushButton::click);
 
     // ================= 进度条 =================
     connect(this, &PageCamera::positionChanged, this, [=](qint64 pos){
@@ -114,7 +121,7 @@ void PageCamera::videoLayout()
 
     liveRenderTimer = new QTimer(this);
     liveRenderTimer->setTimerType(Qt::PreciseTimer);
-    liveRenderTimer->setInterval(16);
+    liveRenderTimer->setInterval(1);
     connect(liveRenderTimer, &QTimer::timeout, this, &PageCamera::renderLiveFrame);
 
     listWidget = new QListWidget();
@@ -509,7 +516,8 @@ void PageCamera::renderLiveFrame()
     if(liveVideoThread->takeLatestFrame(liveLastSequence, &frame)) {
         liveLastSequence = frame.sequence;
         ++liveRenderedFrames;
-        videoLabel->setPixmap(QPixmap::fromImage(frame.image));
+        videoLabel->setPixmap(
+            QPixmap::fromImage(std::move(frame.image), Qt::NoFormatConversion));
     }
 
     const qint64 nowMs = liveStatsClock.elapsed();
@@ -521,12 +529,14 @@ void PageCamera::renderLiveFrame()
         liveDecodeRateSampler.sample(nowMs, liveVideoThread->decodedFrames());
     const double renderedFps =
         liveRenderRateSampler.sample(nowMs, liveRenderedFrames);
-    videoStatusLabel->setText(
+    const QString status =
         formatVideoStatus(inputSize,
                           liveVideoThread->nominalFps(),
                           decodedFps,
                           renderedFps,
-                          liveVideoThread->overwrittenFrames()));
+                          liveVideoThread->overwrittenFrames());
+    videoStatusLabel->setText(status);
+    qInfo().noquote() << "[VIDEO][stats]" << status;
 }
 
 void PageCamera::resetLivePresentation()
