@@ -95,3 +95,22 @@ qint64 frameDurationMs(int rateNumerator, int rateDenominator)
     const double duration = 1000.0 * rateDenominator / rateNumerator;
     return qMax<qint64>(1, qRound64(duration));
 }
+
+QString formatVideoStatus(const QSize &inputSize,
+                          double nominalFps,
+                          double decodedFps,
+                          double renderedFps,
+                          quint64 overwrittenFrames)
+{
+    const QString dimensions = inputSize.isValid()
+                                   ? QStringLiteral("%1x%2")
+                                         .arg(inputSize.width())
+                                         .arg(inputSize.height())
+                                   : QStringLiteral("--x--");
+    return QStringLiteral("输入 %1  码流 %2fps  解码 %3fps  显示 %4fps  覆盖 %5")
+        .arg(dimensions)
+        .arg(nominalFps, 0, 'f', 1)
+        .arg(decodedFps, 0, 'f', 1)
+        .arg(renderedFps, 0, 'f', 1)
+        .arg(overwrittenFrames);
+}

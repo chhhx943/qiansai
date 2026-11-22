@@ -4,6 +4,7 @@
 #include <QImage>
 #include <QMutex>
 #include <QSize>
+#include <QString>
 
 struct VideoFrameSnapshot
 {
@@ -41,5 +42,10 @@ private:
 
 QSize fitVideoInside(const QSize &source, const QSize &bounds);
 qint64 frameDurationMs(int rateNumerator, int rateDenominator);
+QString formatVideoStatus(const QSize &inputSize,
+                          double nominalFps,
+                          double decodedFps,
+                          double renderedFps,
+                          quint64 overwrittenFrames);
 
 #endif // VIDEORUNTIME_H

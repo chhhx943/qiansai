@@ -13,6 +13,7 @@ private slots:
     void fitInsidePreservesSixteenByNine();
     void frameDurationUsesStreamRate();
     void clearRemovesOldFrameAndCounters();
+    void statusTextExposesMeasuredRates();
 };
 
 void VideoRuntimeTest::mailboxReturnsOnlyNewestFrame()
@@ -73,6 +74,12 @@ void VideoRuntimeTest::clearRemovesOldFrameAndCounters()
     VideoFrameSnapshot frame;
     QVERIFY(!mailbox.takeLatest(0, &frame));
     QCOMPARE(mailbox.overwrittenFrames(), quint64(0));
+}
+
+void VideoRuntimeTest::statusTextExposesMeasuredRates()
+{
+    QCOMPARE(formatVideoStatus(QSize(1920, 1080), 59.94, 59.91, 59.83, 4),
+             QStringLiteral("输入 1920x1080  码流 59.9fps  解码 59.9fps  显示 59.8fps  覆盖 4"));
 }
 
 QTEST_MAIN(VideoRuntimeTest)
