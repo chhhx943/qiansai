@@ -3,6 +3,7 @@ test-results/
 tests/.qmake.stash
 tests/Makefile
 tests/*.moc
+tests/moc_predefs.h
 tests/*.o
 tests/target_wrapper.sh
 tests/video_runtime_tests

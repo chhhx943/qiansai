@@ -83,6 +83,49 @@ RK 收到后重新识别区域。
 
 ## 运行方式
 
+### WSL 1080p60 RTMP 实时预览
+
+默认视频地址：
+
+```text
+rtmp://192.168.1.101:1935/live/test
+```
+
+构建环境使用 Qt 6.5.3，并统一使用 Ubuntu 系统 FFmpeg 头文件和动态库，避免不同 FFmpeg 主版本混用导致 ABI 崩溃：
+
+```bash
+cd /home/chx/Linux/qiansai/qt
+rm -rf build-1080p60
+mkdir build-1080p60
+cd build-1080p60
+/home/chx/Qt/6.5.3/gcc_64/bin/qmake ../ngnix_client.pro
+make -j"$(nproc)"
+```
+
+运行：
+
+```bash
+cd /home/chx/Linux/qiansai/qt
+QT_RTMP_AUTOPLAY=1 \
+QT_RTMP_URL=rtmp://192.168.1.101:1935/live/test \
+./build-1080p60/ngnix_client
+```
+
+播放器采用容量为 1 的 latest-frame mailbox：解码线程只保留最新帧，GUI 用高频定时器拉取，慢帧会被覆盖而不会形成无界事件队列。界面状态栏会显示输入尺寸、码流帧率、解码帧率、显示帧率和覆盖帧数。
+
+完整 10 分钟验收：
+
+```bash
+cd /home/chx/Linux/qiansai/qt
+./tests/run_1080p60_acceptance.sh --duration 600
+```
+
+验收脚本要求 RTMP 为 H.264、1920x1080、至少 59fps，并检查 Qt 解码/显示帧率与 RSS 增长；证据写入 `test-results/1080p60/<时间戳>/`。
+
+WSL 使用 mirrored 网络时，局域网设备访问 1935 还需要 Windows Hyper-V 防火墙允许 WSL 入站 TCP 1935。规则名为 `WSL-RTMP-1935-In`，仅开放该端口，不修改默认入站策略。
+
+### 旧虚拟机运行方式
+
 在虚拟机中运行：
 
 ```bash
