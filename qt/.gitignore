@@ -1,13 +1,9 @@
-# qmake/build outputs
-Makefile
-.qmake.stash
-*.o
-moc_*.cpp
-moc_*.o
-moc_predefs.h
-ngnix_client
-
-# editor/system
-.vscode/
-.DS_Store
-Thumbs.db
+build-*/
+test-results/
+tests/.qmake.stash
+tests/Makefile
+tests/*.moc
+tests/moc_predefs.h
+tests/*.o
+tests/target_wrapper.sh
+tests/video_runtime_tests

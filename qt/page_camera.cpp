@@ -12,11 +12,13 @@
 #include <QStandardPaths>
 #include <QSettings>
 #include <cstdio>
+#include <utility>
 
 #include "XVideoThread.h"
 
 namespace {
-const char *kDefaultRtmpUrl = "rtmp://10.36.113.231:1935/fire_live/test";
+const char *kDefaultRtmpUrl = "rtmp://192.168.1.101:1935/live/test";
+const char *kLegacyRtmpUrl = "rtmp://10.36.113.231:1935/fire_live/test";
 const char *kRtmpSettingsKey = "camera/rtmp_url";
 }
 
@@ -56,6 +58,12 @@ PageCamera::PageCamera(QWidget *parent) : QWidget(parent)
                            videoLabel,
                            QStringLiteral("RTMP"));
     });
+
+    const QString environmentRtmpUrl = qEnvironmentVariable("QT_RTMP_URL").trimmed();
+    if(!environmentRtmpUrl.isEmpty())
+        rtmpLineEdit->setText(environmentRtmpUrl);
+    if(qEnvironmentVariableIntValue("QT_RTMP_AUTOPLAY") == 1)
+        QTimer::singleShot(0, rtmpPlayBtn, &QPushButton::click);
 
     // ================= 进度条 =================
     connect(this, &PageCamera::positionChanged, this, [=](qint64 pos){
@@ -106,6 +114,15 @@ void PageCamera::videoLayout()
     videoLabel->setStyleSheet("background:black;");
     videoLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     videoLabel->setMinimumSize(960, 540);
+
+    videoStatusLabel = new QLabel(QStringLiteral("等待 RTMP 连接"), this);
+    videoStatusLabel->setStyleSheet(QStringLiteral(
+        "QLabel{background:#111;color:#6ee7ff;border:1px solid #333;padding:4px;font-family:Consolas;}"));
+
+    liveRenderTimer = new QTimer(this);
+    liveRenderTimer->setTimerType(Qt::PreciseTimer);
+    liveRenderTimer->setInterval(1);
+    connect(liveRenderTimer, &QTimer::timeout, this, &PageCamera::renderLiveFrame);
 
     listWidget = new QListWidget();
     listWidget->setMinimumHeight(520);
@@ -177,7 +194,12 @@ void PageCamera::videoLayout()
     rtmpLineEdit = new QLineEdit(this);
     rtmpLineEdit->setPlaceholderText("请输入 RTMP 地址，例如 rtmp://192.168.1.100/live/stream");
     QSettings settings;
-    rtmpLineEdit->setText(settings.value(kRtmpSettingsKey, QString::fromLatin1(kDefaultRtmpUrl)).toString());
+    QString savedRtmpUrl = settings.value(kRtmpSettingsKey).toString().trimmed();
+    if(savedRtmpUrl.isEmpty() || savedRtmpUrl == QString::fromLatin1(kLegacyRtmpUrl)) {
+        savedRtmpUrl = QString::fromLatin1(kDefaultRtmpUrl);
+        settings.setValue(kRtmpSettingsKey, savedRtmpUrl);
+    }
+    rtmpLineEdit->setText(savedRtmpUrl);
 
     rtmpPlayBtn = new QPushButton("播放", this);
 
@@ -192,6 +214,7 @@ void PageCamera::videoLayout()
     QVBoxLayout *liveLayout = new QVBoxLayout(livePage);
     liveLayout->setContentsMargins(0,0,0,0);
     liveLayout->addLayout(topLayout, 1);
+    liveLayout->addWidget(videoStatusLabel);
     liveLayout->addWidget(durationSlider);
     liveLayout->addLayout(controlLayout);
     liveLayout->addLayout(rtmpLayout);
@@ -400,6 +423,7 @@ void PageCamera::startVideoPlayback(XVideoThread *&thread,
             logPrefix.toUtf8().constData(),
             static_cast<void *>(thread));
     thread->setUrl(url);
+    thread->setOutputSize(targetLabel->contentsRect().size());
 
     connect(thread, &XVideoThread::sig_sendInitState,
             this,
@@ -418,22 +442,31 @@ void PageCamera::startVideoPlayback(XVideoThread *&thread,
             [this, logPrefix](const QString &message){
                 appendAIResult(QStringLiteral("%1 错误：%2").arg(logPrefix, message));
                 if(logPrefix == QStringLiteral("RTMP"))
+                {
+                    videoLabel->clear();
+                    videoStatusLabel->setText(QStringLiteral("RTMP 重连中：%1").arg(message));
                     emit liveStreamStateChanged(false, message);
+                }
                 else if(logPrefix == QStringLiteral("回放"))
                     emit playbackStateChanged(false, message);
             },
             Qt::QueuedConnection);
 
-    connect(thread, &XVideoThread::sig_SendOneFrame,
-            this,
-            [targetLabel](const QImage &img){
-                targetLabel->setPixmap(
-                    QPixmap::fromImage(img).scaled(
-                        targetLabel->size(),
-                        Qt::KeepAspectRatio,
-                        Qt::SmoothTransformation));
-            },
-            Qt::QueuedConnection);
+    if(logPrefix != QStringLiteral("RTMP")) {
+        connect(thread, &XVideoThread::sig_SendOneFrame,
+                this,
+                [targetLabel](const QImage &img){
+                    targetLabel->setPixmap(
+                        QPixmap::fromImage(img).scaled(
+                            targetLabel->size(),
+                            Qt::KeepAspectRatio,
+                            Qt::SmoothTransformation));
+                },
+                Qt::QueuedConnection);
+    } else {
+        resetLivePresentation();
+        liveRenderTimer->start();
+    }
 
     if(logPrefix == QStringLiteral("回放")){
         thread->setPlaybackRate(playbackSpeedCombo->currentData().toDouble());
@@ -468,6 +501,57 @@ void PageCamera::startVideoPlayback(XVideoThread *&thread,
             static_cast<void *>(thread));
 }
 
+void PageCamera::renderLiveFrame()
+{
+    if(!liveVideoThread)
+        return;
+
+    const QSize inputSize = liveVideoThread->inputSize();
+    const QSize bounds = videoLabel->contentsRect().size();
+    const QSize outputSize = fitVideoInside(inputSize, bounds);
+    if(outputSize.isValid())
+        liveVideoThread->setOutputSize(outputSize);
+
+    VideoFrameSnapshot frame;
+    if(liveVideoThread->takeLatestFrame(liveLastSequence, &frame)) {
+        liveLastSequence = frame.sequence;
+        ++liveRenderedFrames;
+        videoLabel->setPixmap(
+            QPixmap::fromImage(std::move(frame.image), Qt::NoFormatConversion));
+    }
+
+    const qint64 nowMs = liveStatsClock.elapsed();
+    if(nowMs - liveLastStatusUpdateMs < 1000)
+        return;
+
+    liveLastStatusUpdateMs = nowMs;
+    const double decodedFps =
+        liveDecodeRateSampler.sample(nowMs, liveVideoThread->decodedFrames());
+    const double renderedFps =
+        liveRenderRateSampler.sample(nowMs, liveRenderedFrames);
+    const QString status =
+        formatVideoStatus(inputSize,
+                          liveVideoThread->nominalFps(),
+                          decodedFps,
+                          renderedFps,
+                          liveVideoThread->overwrittenFrames());
+    videoStatusLabel->setText(status);
+    qInfo().noquote() << "[VIDEO][stats]" << status;
+}
+
+void PageCamera::resetLivePresentation()
+{
+    liveLastSequence = 0;
+    liveRenderedFrames = 0;
+    liveLastStatusUpdateMs = 0;
+    liveDecodeRateSampler.reset();
+    liveRenderRateSampler.reset();
+    liveStatsClock.restart();
+    liveDecodeRateSampler.sample(0, 0);
+    liveRenderRateSampler.sample(0, 0);
+    videoStatusLabel->setText(QStringLiteral("RTMP 连接中：%1").arg(currentRTMPUrl));
+}
+
 void PageCamera::appendAIResult(const QString &result)
 {
     aiResultText->append(result);
@@ -478,6 +562,10 @@ void PageCamera::appendAIResult(const QString &result)
 
 void PageCamera::stopVideoThread(XVideoThread *&thread, const QString &logPrefix)
 {
+    const bool stoppingLive = thread && thread == liveVideoThread;
+    if(stoppingLive && liveRenderTimer)
+        liveRenderTimer->stop();
+
     if(!thread){
         fprintf(stderr, "[VIDEO][ui] stop %s thread skipped, no thread\n",
                 logPrefix.toUtf8().constData());
@@ -493,6 +581,10 @@ void PageCamera::stopVideoThread(XVideoThread *&thread, const QString &logPrefix
     thread->wait();
     delete thread;
     thread = nullptr;
+    if(stoppingLive) {
+        liveLastSequence = 0;
+        videoStatusLabel->setText(QStringLiteral("RTMP 已停止"));
+    }
     fprintf(stderr, "[VIDEO][ui] stop %s thread end\n",
             logPrefix.toUtf8().constData());
 }

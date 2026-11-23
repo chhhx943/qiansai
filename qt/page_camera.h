@@ -15,7 +15,9 @@
 #include <QTimer>
 #include <QThread>
 #include <QImage>
+#include <QElapsedTimer>
 #include "XVideoThread.h"
+#include "VideoRuntime.h"
 
 class XVideoThread;
 
@@ -60,6 +62,8 @@ private:
                             const QString &logPrefix);
     void appendAIResult(const QString &result);
     void stopVideoThread(XVideoThread *&thread, const QString &logPrefix);
+    void renderLiveFrame();
+    void resetLivePresentation();
 
 
     // UI 控件
@@ -91,6 +95,8 @@ private:
     QLineEdit *rtmpLineEdit;
     QPushButton *rtmpPlayBtn;
     QLabel *videoLabel;
+    QLabel *videoStatusLabel;
+    QTimer *liveRenderTimer;
 
     // 播放状态
     QList<MediaObjectInfo> mediaObjectInfo;
@@ -100,6 +106,12 @@ private:
 
     XVideoThread *liveVideoThread;     // 实时监控播放线程
     XVideoThread *playbackVideoThread; // 回放播放线程
+    quint64 liveLastSequence = 0;
+    quint64 liveRenderedFrames = 0;
+    qint64 liveLastStatusUpdateMs = 0;
+    QElapsedTimer liveStatsClock;
+    VideoRateSampler liveDecodeRateSampler;
+    VideoRateSampler liveRenderRateSampler;
 };
 
 #endif // PAGE_CAMERA_H

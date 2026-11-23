@@ -1,4 +1,4 @@
-QT       += core gui network multimedia multimediawidgets charts mqtt
+QT       += core gui network multimedia multimediawidgets charts
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -12,6 +12,7 @@ SOURCES += \
     ModuleStateMachine.cpp \
     AliyunMqttClient.cpp \
     GaugeWidget.cpp \
+    VideoRuntime.cpp \
     XVideoThread.cpp \
     httpclient.cpp \
     main.cpp \
@@ -28,6 +29,7 @@ HEADERS += \
     ModuleStateMachine.h \
     AliyunMqttClient.h \
     GaugeWidget.h \
+    VideoRuntime.h \
     XVideoThread.h \
     httpclient.h \
     mainwindow.h \
@@ -44,13 +46,26 @@ HEADERS += \
 qnx: target.path = /tmp/$${TARGET}/bin
 else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
-INCLUDEPATH += /usr/local/ffmpeg/FFmpeg-master
-LIBS += -L/usr/local/ffmpeg/FFmpeg-master\
-        -lavformat\
+QMAKE_CXXFLAGS += -isystem /usr/include/x86_64-linux-gnu
+LIBS += -lavformat\
         -lavfilter\
         -lavcodec\
         -lavutil\
         -lswscale\
         -lswresample\
         -lavdevice
+
+exists($$[QT_INSTALL_HEADERS]/QtMqtt/qmqttclient.h) {
+    QT += mqtt
+} else {
+    MQTT_LOCAL_ROOT = $$(QT_MQTT_ROOT)
+    isEmpty(MQTT_LOCAL_ROOT): MQTT_LOCAL_ROOT = /home/chx/QT_project/2/ngnix_client/.qt/qtmqtt-6.5.3
+    !exists($$MQTT_LOCAL_ROOT/include/QtMqtt/qmqttclient.h): error("QtMqtt not found; set QT_MQTT_ROOT")
+    INCLUDEPATH += \
+        $$MQTT_LOCAL_ROOT/include \
+        $$MQTT_LOCAL_ROOT/include/QtMqtt
+    LIBS += -L$$MQTT_LOCAL_ROOT/lib -lQt6Mqtt
+    QMAKE_RPATHDIR += $$MQTT_LOCAL_ROOT/lib
+    DEFINES += QT_MQTT_LIB
+}
 RESOURCES +=
