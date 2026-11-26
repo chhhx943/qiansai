@@ -4,9 +4,13 @@ set -euo pipefail
 project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 probe_source="$project_dir/tests/probes/recovery_cross_compile_probe.cc"
 production_sources=(
+    "$project_dir/recovery/src/auth.cc"
+    "$project_dir/recovery/src/authorization.cc"
     "$project_dir/recovery/src/canonical.cc"
     "$project_dir/recovery/src/crypto_openssl.cc"
     "$project_dir/recovery/src/compiler.cc"
+    "$project_dir/recovery/src/proof.cc"
+    "$project_dir/recovery/src/runtime.cc"
 )
 host_dir="$project_dir/build/host/recovery/probes"
 target_dir="$project_dir/build/target/recovery/probes"

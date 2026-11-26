@@ -19,22 +19,6 @@ std::uint64_t epoch_component(const EpochSnapshot& epochs, EpochDomain domain) {
     return 0;
 }
 
-std::optional<EpochSnapshot> advance_epochs(
-    const EpochSnapshot& epochs, const std::set<EpochDomain>& domains) {
-    EpochSnapshot result = epochs;
-    for (const auto domain : domains) {
-        const auto value = epoch_component(epochs, domain);
-        if (value == std::numeric_limits<std::uint64_t>::max()) return std::nullopt;
-        switch (domain) {
-        case EpochDomain::STREAM: result.stream_epoch = value + 1; break;
-        case EpochDomain::AI: result.ai_epoch = value + 1; break;
-        case EpochDomain::WORKER: result.worker_epoch = value + 1; break;
-        case EpochDomain::MEDIA: result.media_epoch = value + 1; break;
-        }
-    }
-    return result;
-}
-
 std::optional<EpochDomain> first_overflowing_domain(
     const EpochSnapshot& epochs, const std::set<EpochDomain>& domains) {
     for (const auto domain : domains) {
@@ -192,18 +176,6 @@ bool dag_valid(const std::vector<ActionNode>& dag) {
                          [](const auto& entry) { return entry.second == 0; }) == 1;
 }
 
-bool epoch_domains_consistent(const std::vector<RecoveryResourcePlan>& plans) {
-    std::map<EpochDomain, std::uint64_t> observed;
-    for (const auto& plan : plans) {
-        for (const auto domain : plan.invalidated_domains) {
-            const auto value = epoch_component(plan.old_epochs, domain);
-            const auto [found, inserted] = observed.emplace(domain, value);
-            if (!inserted && found->second != value) return false;
-        }
-    }
-    return true;
-}
-
 std::set<DeviceTarget> resource_device_closure(
     const FrozenRuntimeSnapshot& snapshot, ResourceInstance resource) {
     std::set<DeviceTarget> result;
@@ -233,6 +205,44 @@ CapabilityExpectation expectation_from(const CapabilityEvidence& evidence) {
 }
 
 }  // namespace
+
+std::optional<EpochSnapshot> advance_epochs(
+    const EpochSnapshot& epochs, const std::set<EpochDomain>& domains) {
+    EpochSnapshot result = epochs;
+    for (const auto domain : domains) {
+        const auto value = epoch_component(epochs, domain);
+        if (value == std::numeric_limits<std::uint64_t>::max()) return std::nullopt;
+        switch (domain) {
+        case EpochDomain::STREAM: result.stream_epoch = value + 1; break;
+        case EpochDomain::AI: result.ai_epoch = value + 1; break;
+        case EpochDomain::WORKER: result.worker_epoch = value + 1; break;
+        case EpochDomain::MEDIA: result.media_epoch = value + 1; break;
+        }
+    }
+    return result;
+}
+
+bool epoch_domains_consistent(const std::vector<RecoveryResourcePlan>& plans) {
+    std::map<EpochDomain, std::uint64_t> observed;
+    for (const auto& plan : plans) {
+        for (const auto domain : plan.invalidated_domains) {
+            const auto value = epoch_component(plan.old_epochs, domain);
+            const auto [found, inserted] = observed.emplace(domain, value);
+            if (!inserted && found->second != value) return false;
+        }
+    }
+    return true;
+}
+
+std::set<EpochDomain> canonical_epoch_domains(
+    const std::vector<RecoveryResourcePlan>& plans) {
+    std::set<EpochDomain> result;
+    for (const auto& plan : plans) {
+        result.insert(plan.invalidated_domains.begin(),
+                      plan.invalidated_domains.end());
+    }
+    return result;
+}
 
 bool process_exit_bindings_are_legal(const FrozenRuntimeSnapshot& snapshot) noexcept {
     const auto& bindings = snapshot.process_exit_bindings;
@@ -316,7 +326,8 @@ PredicateDerivation derive_predicates(
             ? ExecutionProofKind::THREADS_JOINED
             : ExecutionProofKind::PROCESS_EXIT_CONFIRMED;
         ExecutionPredicate predicate{PredicateKey{ExecutionPredicateKey{kind, subject}},
-                                     kind, subject, execution_masks[subject],
+                                     kind, ProofIssuer{0, IssuerRole::EXECUTION_AGENT},
+                                     subject, execution_masks[subject],
                                      std::nullopt, std::nullopt};
         if (const auto* process = std::get_if<ProcessIdentity>(&subject)) {
             const auto* binding = find_process_exit_binding(snapshot, *process);
@@ -375,7 +386,8 @@ PredicateDerivation derive_predicates(
             ? policy.contents->resource_epoch_mask.at(resource->second) : EpochMask{0};
         result.device.push_back(DevicePredicate{
             PredicateKey{DevicePredicateKey{proof_kind->second, device}}, proof_kind->second,
-            device, DeviceTarget{device}, mask, expectation});
+            ProofIssuer{device, IssuerRole::DEVICE_DRIVER}, device, DeviceTarget{device},
+            mask, expectation});
     }
     return result;
 }
@@ -426,7 +438,6 @@ ActionClosureResult canonical_action_closure(
     const PolicySnapshot& policy) {
     std::vector<ActionNode> dag;
     std::vector<ActionId> terminals;
-    std::set<EpochDomain> all_domains;
     for (const auto& plan : plans) {
         const auto recipe = policy.contents->recipes.find({plan.resource_kind, plan.mode});
         if (recipe == policy.contents->recipes.end() || recipe->second.actions.empty()) {
@@ -470,8 +481,8 @@ ActionClosureResult canonical_action_closure(
                             std::get<ExecutorPrincipal>(executor)};
         terminals.push_back(complete.id);
         dag.push_back(std::move(complete));
-        all_domains.insert(plan.invalidated_domains.begin(), plan.invalidated_domains.end());
     }
+    const auto all_domains = canonical_epoch_domains(plans);
     const auto new_epochs = advance_epochs(snapshot.epoch_snapshot, all_domains);
     if (!new_epochs) {
         return ActionClosureFailure{ActionClosureFailureKind::EPOCH_OVERFLOW, std::nullopt,
@@ -496,6 +507,65 @@ CompileResult RecoveryCompiler::compile(
     return compile_impl(snapshot, policy, registry, now, boundary);
 }
 
+RecoveryPlanDerivation derive_resource_plans(
+    const FrozenRuntimeSnapshot&, const std::vector<FaultFact>& faults,
+    const PolicySnapshot& policy) {
+    std::map<ResourceInstance, RecoveryResourcePlan> plans_by_resource;
+    FaultCoverage coverage;
+    std::optional<FallbackAction> fallback;
+    bool plan_conflict = false;
+    for (const auto& fault : faults) {
+        const auto disposition = policy.contents->dispositions.find(fault.kind);
+        const auto resource = resource_for(fault.kind);
+        if (disposition == policy.contents->dispositions.end() || !resource
+            || disposition->second == FaultDisposition::UNRECOVERABLE) {
+            const auto fallback_kind = policy.contents->fallbacks.find(fault.kind);
+            std::optional<FallbackAction> entry_fallback;
+            if (fallback_kind != policy.contents->fallbacks.end()) {
+                entry_fallback = FallbackAction{fallback_kind->second, {fault.id}};
+                if (!fallback || fallback_kind->second == FallbackKind::BOARD_RESTART_REQUIRED) {
+                    auto triggers = fallback ? fallback->triggering_faults : std::set<FaultIdentity>{};
+                    fallback = FallbackAction{fallback_kind->second, std::move(triggers)};
+                }
+                fallback->triggering_faults.insert(fault.id);
+            }
+            coverage.entries.push_back(
+                {fault.id, FaultDisposition::UNRECOVERABLE, {}, entry_fallback});
+            continue;
+        }
+        RecoveryResourcePlan plan{fault.subject.resource, resource->first, resource->second,
+                                  fault.observed_epochs, {}};
+        plan.invalidated_domains = resource->first == ResourceKind::WORKER_PROCESS
+            ? std::set<EpochDomain>{EpochDomain::WORKER}
+            : resource->first == ResourceKind::RKNN_AI
+                ? std::set<EpochDomain>{EpochDomain::AI}
+                : resource->first == ResourceKind::RGA
+                    || resource->first == ResourceKind::MPP_ENCODER
+                    || resource->first == ResourceKind::RTMP_SINK
+                    || resource->first == ResourceKind::RECORD_SINK
+                    ? std::set<EpochDomain>{EpochDomain::MEDIA}
+                    : std::set<EpochDomain>{EpochDomain::STREAM};
+        const auto [existing, inserted] =
+            plans_by_resource.emplace(plan.resource, plan);
+        if (!inserted && existing->second != plan) plan_conflict = true;
+        coverage.entries.push_back({fault.id, disposition->second, {plan.resource}, std::nullopt});
+    }
+    std::vector<RecoveryResourcePlan> plans;
+    for (auto& entry : plans_by_resource) plans.push_back(std::move(entry.second));
+    if (std::any_of(coverage.entries.begin(), coverage.entries.end(), [](const auto& entry) {
+            return entry.disposition == FaultDisposition::UNRECOVERABLE;
+        })) {
+        const auto outcome = !fallback ? DerivationOutcome::FAIL_CLOSED
+            : fallback->kind == FallbackKind::BOARD_RESTART_REQUIRED
+                ? DerivationOutcome::BOARD_RESTART_REQUIRED
+                : DerivationOutcome::PARENT_SERVICE_RESTART;
+        return {outcome, {}, std::move(coverage), std::move(fallback),
+                plan_conflict};
+    }
+    return {DerivationOutcome::ONLINE_RECOVERY, std::move(plans),
+            std::move(coverage), std::nullopt, plan_conflict};
+}
+
 CompileResult RecoveryCompiler::compile_impl(
     const FrozenRuntimeSnapshot& snapshot, const PolicySnapshot& policy,
     const CapabilityRegistrySnapshot& registry, TrustedMonotonicTime now,
@@ -511,63 +581,18 @@ CompileResult RecoveryCompiler::compile_impl(
             return failure;
         }
         allocation_boundary.checkpoint(CompilerAllocationStage::DERIVE_PLANS);
-        std::map<ResourceInstance, RecoveryResourcePlan> plans_by_resource;
-        FaultCoverage coverage;
-        std::optional<FallbackAction> fallback;
-        bool plan_conflict = false;
-        for (const auto& fault : snapshot.fault_batch) {
-            auto disposition = policy.contents->dispositions.find(fault.kind);
-            const auto resource = resource_for(fault.kind);
-            if (disposition == policy.contents->dispositions.end() || !resource
-                || disposition->second == FaultDisposition::UNRECOVERABLE) {
-                const auto fallback_kind = policy.contents->fallbacks.find(fault.kind);
-                if (fallback_kind != policy.contents->fallbacks.end()) {
-                    if (!fallback
-                        || fallback_kind->second == FallbackKind::BOARD_RESTART_REQUIRED) {
-                        if (!fallback || fallback->kind != FallbackKind::BOARD_RESTART_REQUIRED) {
-                            const auto prior = fallback
-                                ? fallback->triggering_faults : std::set<FaultIdentity>{};
-                            fallback = FallbackAction{fallback_kind->second, prior};
-                        }
-                    }
-                    fallback->triggering_faults.insert(fault.id);
-                }
-                std::optional<FallbackAction> entry_fallback;
-                if (fallback_kind != policy.contents->fallbacks.end()) {
-                    entry_fallback = FallbackAction{fallback_kind->second, {fault.id}};
-                }
-                coverage.entries.push_back(
-                    {fault.id, FaultDisposition::UNRECOVERABLE, {}, entry_fallback});
-                continue;
-            }
-            const auto plan = RecoveryResourcePlan{fault.subject.resource, resource->first,
-                                                   resource->second, fault.observed_epochs,
-                                                   resource->first == ResourceKind::WORKER_PROCESS
-                                                       ? std::set<EpochDomain>{EpochDomain::WORKER}
-                                                       : resource->first == ResourceKind::RKNN_AI
-                                                           ? std::set<EpochDomain>{EpochDomain::AI}
-                                                           : resource->first == ResourceKind::RGA
-                                                               || resource->first == ResourceKind::MPP_ENCODER
-                                                               || resource->first == ResourceKind::RTMP_SINK
-                                                               || resource->first == ResourceKind::RECORD_SINK
-                                                               ? std::set<EpochDomain>{EpochDomain::MEDIA}
-                                                               : std::set<EpochDomain>{EpochDomain::STREAM}};
-            const auto [existing, inserted] = plans_by_resource.emplace(plan.resource, plan);
-            if (!inserted && existing->second != plan) plan_conflict = true;
-            coverage.entries.push_back({fault.id, disposition->second, {plan.resource}, std::nullopt});
+        auto derivation = derive_resource_plans(snapshot, snapshot.fault_batch, policy);
+        if (derivation.outcome != DerivationOutcome::ONLINE_RECOVERY) {
+            return CompileFailure{CompileFailure::Kind::FALLBACK_REQUIRED,
+                                  derivation.fallback};
         }
-        if (std::any_of(coverage.entries.begin(), coverage.entries.end(), [](const auto& entry) {
-                return entry.disposition == FaultDisposition::UNRECOVERABLE;
-            })) {
-            return CompileFailure{CompileFailure::Kind::FALLBACK_REQUIRED, fallback};
+        if (derivation.plan_conflict) {
+            return CompileFailure{CompileFailure::Kind::INVALID_DAG};
         }
-        std::vector<RecoveryResourcePlan> plans;
-        for (auto& [resource, plan] : plans_by_resource) {
-            (void)resource;
-            plans.push_back(std::move(plan));
-        }
+        auto plans = std::move(derivation.resource_plans);
+        auto coverage = std::move(derivation.fault_coverage);
         if (plans.empty()) return CompileFailure{CompileFailure::Kind::EMPTY_PLAN};
-        if (plan_conflict || !epoch_domains_consistent(plans)) {
+        if (!epoch_domains_consistent(plans)) {
             return CompileFailure{CompileFailure::Kind::INVALID_DAG};
         }
         allocation_boundary.checkpoint(CompilerAllocationStage::ACTION_CLOSURE);

@@ -44,6 +44,13 @@ private:
 [[nodiscard]] const ProcessExitBindingDescriptor* find_process_exit_binding(
     const FrozenRuntimeSnapshot&, const ProcessIdentity&) noexcept;
 
+[[nodiscard]] std::optional<EpochSnapshot> advance_epochs(
+    const EpochSnapshot&, const std::set<EpochDomain>&);
+[[nodiscard]] bool epoch_domains_consistent(
+    const std::vector<RecoveryResourcePlan>&);
+[[nodiscard]] std::set<EpochDomain> canonical_epoch_domains(
+    const std::vector<RecoveryResourcePlan>&);
+
 [[nodiscard]] ActionClosureResult canonical_action_closure(
     const std::vector<RecoveryResourcePlan>&, const FrozenRuntimeSnapshot&,
     const PolicySnapshot&);
